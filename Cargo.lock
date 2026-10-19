@@ -301,6 +301,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "metalfx_wgpu"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "bytemuck",
  "glam",
  "half",
@@ -460,6 +461,7 @@ dependencies = [
  "bitflags",
  "block2",
  "objc2",
+ "objc2-core-foundation",
  "objc2-foundation",
 ]
 

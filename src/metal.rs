@@ -1,8 +1,15 @@
-use objc2::rc::Retained;
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use block2::RcBlock;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject, Sel};
 use objc2::{Message, sel};
 use objc2_metal::{
-    MTLDevice, MTLPixelFormat, MTLResource, MTLStorageMode, MTLTexture, MTLTextureUsage,
+    MTLCommandBuffer, MTLDevice, MTLPixelFormat, MTLResource, MTLStorageMode, MTLTexture,
+    MTLTextureUsage,
 };
 use objc2_metal_fx::{
     MTLFXTemporalDenoisedScaler, MTLFXTemporalDenoisedScalerBase,
@@ -18,6 +25,8 @@ use crate::{DenoiserDescriptor, DenoiserParams, DenoiserTextures, Error, Require
 pub struct MetalFxDenoiser {
     scaler: Retained<ProtocolObject<dyn MTLFXTemporalDenoisedScaler>>,
     descriptor: DenoiserDescriptor,
+    /// GPU time of the last completed encode, as `f64` seconds bits. `None` if timing is off.
+    gpu_time: Option<Arc<AtomicU64>>,
 }
 
 // SAFETY: Metal objects can be used from any thread. Every call that changes the scaler's state
@@ -70,6 +79,12 @@ impl MetalFxDenoiser {
     }
 
     pub fn new(device: &wgpu::Device, descriptor: DenoiserDescriptor) -> Result<Self, Error> {
+        // MetalFX autoreleases objects. Bevy's render thread has no autorelease pool, so drain
+        // our own or they pile up until the thread exits.
+        autoreleasepool(|_| Self::new_inner(device, descriptor))
+    }
+
+    fn new_inner(device: &wgpu::Device, descriptor: DenoiserDescriptor) -> Result<Self, Error> {
         let support = Self::support(device).ok_or(Error::Unsupported)?;
         let d = &descriptor;
         for scale in [
@@ -121,7 +136,11 @@ impl MetalFxDenoiser {
             return Err(Error::Unsupported);
         }
 
-        Ok(Self { scaler, descriptor })
+        Ok(Self {
+            scaler,
+            descriptor,
+            gpu_time: None,
+        })
     }
 
     pub fn descriptor(&self) -> &DenoiserDescriptor {
@@ -147,6 +166,15 @@ impl MetalFxDenoiser {
     /// Encode one frame into a new command buffer. Submit it after the work that writes the inputs
     /// and before the work that reads the output.
     pub fn encode(
+        &mut self,
+        device: &wgpu::Device,
+        textures: DenoiserTextures<'_>,
+        params: &DenoiserParams,
+    ) -> Result<wgpu::CommandBuffer, Error> {
+        autoreleasepool(|_| self.encode_inner(device, textures, params))
+    }
+
+    fn encode_inner(
         &mut self,
         device: &wgpu::Device,
         textures: DenoiserTextures<'_>,
@@ -263,6 +291,20 @@ impl MetalFxDenoiser {
             encoder.as_hal_mut::<Metal, _, _>(|hal_encoder| {
                 let command_buffer = hal_encoder?.raw_command_buffer()?;
                 s.encodeToCommandBuffer(command_buffer);
+                if let Some(slot) = &self.gpu_time {
+                    // The command buffer only holds MetalFX work, so its GPU time is the
+                    // denoiser's.
+                    let slot = slot.clone();
+                    let handler =
+                        RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                            let cb = cb.as_ref();
+                            slot.store(
+                                (cb.GPUEndTime() - cb.GPUStartTime()).to_bits(),
+                                Ordering::Relaxed,
+                            );
+                        });
+                    command_buffer.addCompletedHandler(RcBlock::as_ptr(&handler));
+                }
                 Some(())
             })
         };
@@ -282,6 +324,17 @@ impl MetalFxDenoiser {
 
         encoded.ok_or(Error::NotMetal)?;
         Ok(encoder.finish())
+    }
+
+    /// Measure the GPU time of each encode (see [`Self::last_gpu_time`]).
+    pub fn set_gpu_timing(&mut self, enabled: bool) {
+        self.gpu_time = enabled.then(|| Arc::new(AtomicU64::new(f64::NAN.to_bits())));
+    }
+
+    /// GPU time of the most recently *completed* encode, if timing is on and one has completed.
+    pub fn last_gpu_time(&self) -> Option<Duration> {
+        let seconds = f64::from_bits(self.gpu_time.as_ref()?.load(Ordering::Relaxed));
+        (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs_f64(seconds))
     }
 
     /// The scaler's current `worldToViewMatrix` (column-major).
