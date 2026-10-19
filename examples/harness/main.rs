@@ -38,6 +38,8 @@ struct Options {
     zero_matrices: bool,
     view_space_normals: bool,
     no_reset_on_cut: bool,
+    /// Also reset history every N frames (0 = never), to check that reset is honored.
+    reset_every: u32,
     no_jitter: bool,
     moving_light: bool,
     ema_alpha: f32,
@@ -59,6 +61,7 @@ impl Default for Options {
             zero_matrices: false,
             view_space_normals: false,
             no_reset_on_cut: false,
+            reset_every: 0,
             no_jitter: false,
             moving_light: false,
             ema_alpha: 0.1,
@@ -81,6 +84,7 @@ options:
   --zero-matrices        don't set worldToView / viewToClip
   --view-normals         write view-space instead of world-space normals
   --no-reset-on-cut      don't reset history at the camera cut
+  --reset-every N        also reset history every N frames (0 = never)
   --no-jitter            disable sub-pixel jitter
   --moving-light         move the light sideways over time
   --ema-alpha A          blend factor of the EMA baseline (default 0.1)
@@ -113,6 +117,7 @@ fn parse_args() -> Options {
             "--zero-matrices" => o.zero_matrices = true,
             "--view-normals" => o.view_space_normals = true,
             "--no-reset-on-cut" => o.no_reset_on_cut = true,
+            "--reset-every" => o.reset_every = value().parse().unwrap(),
             "--no-jitter" => o.no_jitter = true,
             "--moving-light" => o.moving_light = true,
             "--ema-alpha" => o.ema_alpha = value().parse().unwrap(),
@@ -505,6 +510,8 @@ fn main() {
         ..DenoiserDescriptor::solari(o.input, o.output)
     };
     let mut denoiser = MetalFxDenoiser::new(&device, desc).expect("failed to create denoiser");
+    denoiser.set_gpu_timing(true);
+    let mut gpu_times = Vec::new();
     let usages = denoiser.required_usages();
 
     // Inputs are written by the scene shader (so wgpu considers them initialized).
@@ -826,7 +833,9 @@ fn main() {
                 bytemuck::bytes_of(&reference_uniforms_data),
             );
         }
-        let reset_history = frame == 0 || (phase == Phase::Cut && !o.no_reset_on_cut);
+        let reset_history = frame == 0
+            || (phase == Phase::Cut && !o.no_reset_on_cut)
+            || (o.reset_every > 0 && frame % o.reset_every == 0);
         queue.write_buffer(
             &ema_uniforms,
             0,
@@ -888,6 +897,11 @@ fn main() {
         queue.submit([denoiser
             .encode(&device, textures, &params)
             .expect("encode failed")]);
+        // Wait so the timing is this frame's and the GPU isn't busy with other work.
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        if frame >= 60 {
+            gpu_times.extend(denoiser.last_gpu_time().map(|t| t.as_secs_f64() * 1e3));
+        }
 
         if evaluate {
             let reference_px = read_rgb(&device, &queue, &reference);
@@ -938,6 +952,19 @@ fn main() {
         start.elapsed().as_secs_f64(),
         out_dir.display()
     );
+    gpu_times.sort_by(f64::total_cmp);
+    if !gpu_times.is_empty() {
+        let pct = |p: f64| gpu_times[((gpu_times.len() - 1) as f64 * p) as usize];
+        println!(
+            "MetalFX GPU time {:?} -> {:?}: median {:.2} ms, p95 {:.2} ms, min {:.2} ms ({} frames)",
+            o.input,
+            o.output,
+            pct(0.5),
+            pct(0.95),
+            gpu_times[0],
+            gpu_times.len()
+        );
+    }
     println!(
         "{:<16} {:>8} {:>10} {:>8}",
         "phase", "noisy", "denoised", "ema"
