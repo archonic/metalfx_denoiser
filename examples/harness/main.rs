@@ -52,7 +52,7 @@ impl Default for Options {
             input: [960, 540],
             output: [960, 540],
             frames: 600,
-            reference_spp: 256,
+            reference_spp: 1024,
             eval_every: 10,
             mv_scale_sign: -1.0,
             mv_scale_output: false,
@@ -75,7 +75,7 @@ options:
   --input WxH            render resolution (default 960x540)
   --output WxH           output resolution (default = input)
   --frames N             frames to run (default 600; the camera script scales with it)
-  --reference-spp N      reference samples per pixel (default 256)
+  --reference-spp N      reference samples per pixel (default 1024)
   --eval-every N         compute metrics every N frames (default 10; cut frames always)
   --mv-sign S            motion_vector_scale = S * size (default -1)
   --mv-output-size       scale motion vectors by output size instead of input size
@@ -1001,7 +1001,7 @@ fn main() {
         );
         let cut_ratio = cut_denoised / cut_noisy;
         println!(
-            "  [{}] #4 cut: denoised/noisy = {cut_ratio:.2} (<= 1.5)",
+            "  [{}] #4 cut: no ghosting, denoised/noisy = {cut_ratio:.2} (<= 1.5)",
             check(cut_ratio <= 1.5)
         );
     }
