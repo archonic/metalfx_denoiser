@@ -1,0 +1,20 @@
+[package]
+name = "metalfx_wgpu"
+version = "0.1.0"
+edition = "2024"
+description = "MetalFX temporal denoised scaler (MTLFXTemporalDenoisedScaler) for wgpu's Metal backend"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal", "wgsl", "std"] }
+thiserror = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLTexture", "MTLCommandBuffer", "MTLPixelFormat", "MTLResource", "MTLAllocation", "MTLFence"] }
+objc2-metal-fx = { version = "0.3.2", default-features = false, features = ["std", "MTLFXTemporalDenoisedScaler", "MTLFXTemporalScaler"] }
+
+[dev-dependencies]
+pollster = "0.4"
+half = "2"
