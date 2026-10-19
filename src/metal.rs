@@ -8,7 +8,8 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject, Sel};
 use objc2::{Message, sel};
 use objc2_metal::{
-    MTLCommandBuffer, MTLDevice, MTLPixelFormat, MTLResource, MTLStorageMode, MTLTexture,
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLOrigin,
+    MTLPixelFormat, MTLResource, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
     MTLTextureUsage,
 };
 use objc2_metal_fx::{
@@ -27,7 +28,20 @@ pub struct MetalFxDenoiser {
     descriptor: DenoiserDescriptor,
     /// GPU time of the last completed encode, as `f64` seconds bits. `None` if timing is off.
     gpu_time: Option<Arc<AtomicU64>>,
+    /// Exact-size copies of oversized inputs, indexed like [`INPUT_NAMES`].
+    scratch: [Option<Retained<ProtocolObject<dyn MTLTexture>>>; 7],
 }
+
+/// Inputs in the order the scaler's texture properties are handled.
+const INPUT_NAMES: [&str; 7] = [
+    "color",
+    "depth",
+    "motion",
+    "diffuse albedo",
+    "specular albedo",
+    "normal",
+    "roughness",
+];
 
 // SAFETY: Metal objects can be used from any thread. Every call that changes the scaler's state
 // takes `&mut self`, so no two threads can configure or encode with it at the same time.
@@ -140,6 +154,7 @@ impl MetalFxDenoiser {
             scaler,
             descriptor,
             gpu_time: None,
+            scratch: Default::default(),
         })
     }
 
@@ -190,86 +205,92 @@ impl MetalFxDenoiser {
             let guard = unsafe { t.as_hal::<Metal>() }.ok_or(Error::NotMetal)?;
             Ok::<_, Error>(guard.raw_handle().retain())
         };
-        let color = hal(textures.color)?;
-        let depth = hal(textures.depth)?;
-        let motion = hal(textures.motion)?;
-        let diffuse_albedo = hal(textures.diffuse_albedo)?;
-        let specular_albedo = hal(textures.specular_albedo)?;
-        let normal = hal(textures.normal)?;
-        let roughness = hal(textures.roughness)?;
-        let out = hal(textures.output)?;
+        let (formats, usages) = unsafe {
+            (
+                [
+                    s.colorTextureFormat(),
+                    s.depthTextureFormat(),
+                    s.motionTextureFormat(),
+                    s.diffuseAlbedoTextureFormat(),
+                    s.specularAlbedoTextureFormat(),
+                    s.normalTextureFormat(),
+                    s.roughnessTextureFormat(),
+                ],
+                [
+                    s.colorTextureUsage(),
+                    s.depthTextureUsage(),
+                    s.motionTextureUsage(),
+                    s.diffuseAlbedoTextureUsage(),
+                    s.specularAlbedoTextureUsage(),
+                    s.normalTextureUsage(),
+                    s.roughnessTextureUsage(),
+                ],
+            )
+        };
+        let sources = [
+            textures.color,
+            textures.depth,
+            textures.motion,
+            textures.diffuse_albedo,
+            textures.specular_albedo,
+            textures.normal,
+            textures.roughness,
+        ];
 
+        // Inputs larger than `input_size` (e.g. Bevy's view target under a resolution override)
+        // are cropped to their top-left region into scratch textures: MetalFX requires exact sizes.
+        let mut inputs = Vec::with_capacity(INPUT_NAMES.len());
+        let mut crops = Vec::new();
+        for (i, source) in sources.into_iter().enumerate() {
+            let raw = hal(source)?;
+            let name = INPUT_NAMES[i];
+            validate(name, &raw, formats[i], usages[i])?;
+            let size = [raw.width() as u32, raw.height() as u32];
+            if size == input {
+                inputs.push(raw);
+            } else if size[0] >= input[0] && size[1] >= input[1] {
+                let scratch = self.scratch_texture(i, &raw, formats[i], usages[i])?;
+                crops.push((raw, scratch.clone()));
+                inputs.push(scratch);
+            } else {
+                return Err(Error::TextureMismatch {
+                    texture: name,
+                    reason: format!("size is {size:?}, smaller than the input size {input:?}"),
+                });
+            }
+        }
+        let out = hal(textures.output)?;
+        let s = &self.scaler;
         unsafe {
-            validate(
-                "color",
-                &color,
-                input,
-                s.colorTextureFormat(),
-                s.colorTextureUsage(),
-            )?;
-            validate(
-                "depth",
-                &depth,
-                input,
-                s.depthTextureFormat(),
-                s.depthTextureUsage(),
-            )?;
-            validate(
-                "motion",
-                &motion,
-                input,
-                s.motionTextureFormat(),
-                s.motionTextureUsage(),
-            )?;
-            validate(
-                "diffuse albedo",
-                &diffuse_albedo,
-                input,
-                s.diffuseAlbedoTextureFormat(),
-                s.diffuseAlbedoTextureUsage(),
-            )?;
-            validate(
-                "specular albedo",
-                &specular_albedo,
-                input,
-                s.specularAlbedoTextureFormat(),
-                s.specularAlbedoTextureUsage(),
-            )?;
-            validate(
-                "normal",
-                &normal,
-                input,
-                s.normalTextureFormat(),
-                s.normalTextureUsage(),
-            )?;
-            validate(
-                "roughness",
-                &roughness,
-                input,
-                s.roughnessTextureFormat(),
-                s.roughnessTextureUsage(),
-            )?;
             validate(
                 "output",
                 &out,
-                output,
                 s.outputTextureFormat(),
                 s.outputTextureUsage(),
-            )?;
-            if out.storageMode() != MTLStorageMode::Private {
-                return Err(Error::TextureMismatch {
-                    texture: "output",
-                    reason: "MetalFX requires private storage mode".into(),
-                });
-            }
+            )?
+        };
+        let out_size = [out.width() as u32, out.height() as u32];
+        if out_size != output {
+            return Err(Error::TextureMismatch {
+                texture: "output",
+                reason: format!("size is {out_size:?}, expected {output:?}"),
+            });
+        }
+        if out.storageMode() != MTLStorageMode::Private {
+            return Err(Error::TextureMismatch {
+                texture: "output",
+                reason: "MetalFX requires private storage mode".into(),
+            });
+        }
 
-            s.setColorTexture(Some(&color));
-            s.setDepthTexture(Some(&depth));
-            s.setMotionTexture(Some(&motion));
-            s.setDiffuseAlbedoTexture(Some(&diffuse_albedo));
-            s.setSpecularAlbedoTexture(Some(&specular_albedo));
-            s.setNormalTexture(Some(&normal));
-            s.setRoughnessTexture(Some(&roughness));
+        unsafe {
+            s.setColorTexture(Some(&inputs[0]));
+            s.setDepthTexture(Some(&inputs[1]));
+            s.setMotionTexture(Some(&inputs[2]));
+            s.setDiffuseAlbedoTexture(Some(&inputs[3]));
+            s.setSpecularAlbedoTexture(Some(&inputs[4]));
+            s.setNormalTexture(Some(&inputs[5]));
+            s.setRoughnessTexture(Some(&inputs[6]));
             s.setOutputTexture(Some(&out));
 
             s.setJitterOffsetX(params.jitter_offset[0]);
@@ -283,34 +304,57 @@ impl MetalFxDenoiser {
         send_matrix(s, world_to_view_sels().0, params.world_to_view);
         send_matrix(s, view_to_clip_sels().0, params.view_to_clip);
 
+        // wgpu-hal records into command buffers with unretained references, and wgpu doesn't know
+        // which textures this work uses. Keep every one alive until the GPU is done with it.
+        let mut keep_alive: Vec<Retained<ProtocolObject<dyn MTLTexture>>> = inputs.clone();
+        keep_alive.push(out.clone());
+        keep_alive.extend(crops.iter().map(|(source, _)| source.clone()));
+
         // A dedicated encoder that only ever carries the MetalFX work.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("metalfx_denoiser"),
         });
+        let gpu_time = self.gpu_time.clone();
         let encoded = unsafe {
             encoder.as_hal_mut::<Metal, _, _>(|hal_encoder| {
                 let command_buffer = hal_encoder?.raw_command_buffer()?;
+                if !crops.is_empty() {
+                    let blit = command_buffer.blitCommandEncoder()?;
+                    for (source, scratch) in &crops {
+                        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            source,
+                            0,
+                            0,
+                            MTLOrigin { x: 0, y: 0, z: 0 },
+                            MTLSize { width: input[0] as usize, height: input[1] as usize, depth: 1 },
+                            scratch,
+                            0,
+                            0,
+                            MTLOrigin { x: 0, y: 0, z: 0 },
+                        );
+                    }
+                    blit.endEncoding();
+                }
                 s.encodeToCommandBuffer(command_buffer);
-                if let Some(slot) = &self.gpu_time {
-                    // The command buffer only holds MetalFX work, so its GPU time is the
-                    // denoiser's.
-                    let slot = slot.clone();
-                    let handler =
-                        RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+
+                let handler =
+                    RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                        let _ = &keep_alive;
+                        if let Some(slot) = &gpu_time {
+                            // The command buffer only holds the denoiser's work.
                             let cb = cb.as_ref();
                             slot.store(
                                 (cb.GPUEndTime() - cb.GPUStartTime()).to_bits(),
                                 Ordering::Relaxed,
                             );
-                        });
-                    command_buffer.addCompletedHandler(RcBlock::as_ptr(&handler));
-                }
+                        }
+                    });
+                command_buffer.addCompletedHandler(RcBlock::as_ptr(&handler));
                 Some(())
             })
         };
 
-        // Drop our references so the scaler doesn't keep textures alive across resizes. MetalFX
-        // keeps whatever it needs for the encoded work.
+        // Drop the scaler's references so it doesn't keep textures alive across resizes.
         unsafe {
             s.setColorTexture(None);
             s.setDepthTexture(None);
@@ -324,6 +368,39 @@ impl MetalFxDenoiser {
 
         encoded.ok_or(Error::NotMetal)?;
         Ok(encoder.finish())
+    }
+
+    /// Exact-size texture that input `slot` is cropped into, (re)created to match `source`.
+    fn scratch_texture(
+        &mut self,
+        slot: usize,
+        source: &ProtocolObject<dyn MTLTexture>,
+        format: MTLPixelFormat,
+        usage: MTLTextureUsage,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, Error> {
+        let [width, height] = self.descriptor.input_size;
+        if let Some(existing) = &self.scratch[slot] {
+            return Ok(existing.clone());
+        }
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                format,
+                width as usize,
+                height as usize,
+                false,
+            )
+        };
+        descriptor.setUsage(usage);
+        descriptor.setStorageMode(MTLStorageMode::Private);
+        let texture = source
+            .device()
+            .newTextureWithDescriptor(&descriptor)
+            .ok_or(Error::TextureMismatch {
+                texture: INPUT_NAMES[slot],
+                reason: "failed to allocate a scratch texture for cropping".into(),
+            })?;
+        self.scratch[slot] = Some(texture.clone());
+        Ok(texture)
     }
 
     /// Measure the GPU time of each encode (see [`Self::last_gpu_time`]).
@@ -392,7 +469,6 @@ fn receive_matrix(_: &ProtocolObject<dyn MTLFXTemporalDenoisedScaler>, _: Sel) -
 fn validate(
     name: &'static str,
     texture: &ProtocolObject<dyn MTLTexture>,
-    size: [u32; 2],
     format: MTLPixelFormat,
     usage: MTLTextureUsage,
 ) -> Result<(), Error> {
@@ -402,10 +478,6 @@ fn validate(
             reason,
         })
     };
-    let actual_size = [texture.width() as u32, texture.height() as u32];
-    if actual_size != size {
-        return mismatch(format!("size is {actual_size:?}, expected {size:?}"));
-    }
     if texture.pixelFormat() != format {
         return mismatch(format!(
             "pixel format is {:?}, expected {format:?}",

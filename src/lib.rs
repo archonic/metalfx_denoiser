@@ -106,7 +106,12 @@ pub struct RequiredUsages {
     pub output: wgpu::TextureUsages,
 }
 
-/// Textures for one frame. All inputs are `input_size`, the output is `output_size`.
+/// Textures for one frame.
+///
+/// Inputs must be at least `input_size`. If one is larger, its top-left `input_size` region is
+/// used: it is copied into an exact-size texture first, because MetalFX itself rejects any size
+/// mismatch. This matches how Bevy renders into part of a full-size view target under a resolution
+/// override. The output must be exactly `output_size`.
 #[derive(Clone, Copy)]
 pub struct DenoiserTextures<'a> {
     /// Noisy HDR color.

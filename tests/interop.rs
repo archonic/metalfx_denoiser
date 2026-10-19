@@ -57,7 +57,9 @@ fn frame(device: &wgpu::Device, queue: &wgpu::Queue, desc: &DenoiserDescriptor) 
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         })
     };
@@ -273,6 +275,69 @@ fn encodes_constant_image() {
         assert!(
             max_err < 0.02,
             "{input:?} -> {output:?}: max error {max_err}, center {center:?}"
+        );
+    }
+}
+
+/// Inputs larger than the configured input size, with the real content in the top-left, as Bevy
+/// hands them over under `MainPassResolutionOverride`. Everything outside that region is garbage
+/// that must not leak into the output.
+#[test]
+fn crops_oversized_inputs() {
+    let (device, queue) = device();
+    for (input, output) in [([256, 256], [256, 256]), ([128, 128], [256, 256])] {
+        let desc = DenoiserDescriptor {
+            requires_synchronous_initialization: true,
+            auto_exposure: false,
+            ..DenoiserDescriptor::solari(input, output)
+        };
+        let mut denoiser = MetalFxDenoiser::new(&device, desc).unwrap();
+        // All inputs allocated at the output size, like Bevy's view target and prepass textures.
+        let f = frame(
+            &device,
+            &queue,
+            &DenoiserDescriptor {
+                input_size: output,
+                ..desc
+            },
+        );
+        let garbage = [50.0, 0.0, 50.0, 1.0].map(half::f16::from_f32);
+        let color: Vec<u8> = (0..output[0] * output[1])
+            .flat_map(|i| {
+                let (x, y) = (i % output[0], i / output[0]);
+                let px = if x < input[0] && y < input[1] {
+                    COLOR.map(half::f16::from_f64)
+                } else {
+                    garbage
+                };
+                px.into_iter().flat_map(|h| h.to_le_bytes())
+            })
+            .collect();
+        queue.write_texture(
+            f.color.as_image_copy(),
+            &color,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(output[0] * 8),
+                rows_per_image: None,
+            },
+            f.color.size(),
+        );
+        for i in 0..8 {
+            let params = DenoiserParams {
+                reset: i == 0,
+                ..Default::default()
+            };
+            queue.submit([denoiser.encode(&device, f.textures(), &params).unwrap()]);
+        }
+        let texels = read_rgba16f(&device, &queue, &f.output);
+        let max_err = texels
+            .iter()
+            .flat_map(|t| (0..3).map(move |c| (t[c] - COLOR[c] as f32).abs()))
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 0.02,
+            "{input:?} in {output:?} textures: max error {max_err}"
         );
     }
 }
