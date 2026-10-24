@@ -13,6 +13,12 @@ path-traced frame from wgpu textures, using the guide-buffer formats Solari alre
 *Left to right: 1 sample per pixel input, MetalFX output, 1024-spp reference. From the headless
 harness after 200 frames with a static camera.*
 
+[![Bevy's Solari example: no denoiser on the left, MetalFX denoiser on the right](docs/solari_metalfx_split.jpg)](docs/solari_metalfx_split_small.mp4)
+
+*Click to play (10 s). Bevy's `solari` example with this crate plugged in: raw Solari output on the
+left, MetalFX denoiser on the right. Rendered on an M2 Pro at a fixed 30 fps timestep; live, the app
+runs slower, so the denoiser sees more motion per frame than in this video.*
+
 > **Status:** prototype. The API may change, and the crate isn't on crates.io. A Bevy integration
 > (a `metalfx` feature in `bevy_anti_alias` plus Solari guide-buffer changes) works locally and
 > will be proposed upstream separately.
