@@ -1,7 +1,7 @@
 //! Hardware tests: these need a Mac running macOS 26+ with a GPU that supports the denoiser.
 #![cfg(target_os = "macos")]
 
-use metalfx_wgpu::{DenoiserDescriptor, DenoiserParams, DenoiserTextures, Error, MetalFxDenoiser};
+use metalfx_denoiser::{DenoiserDescriptor, DenoiserParams, DenoiserTextures, Error, MetalFxDenoiser};
 
 fn device() -> (wgpu::Device, wgpu::Queue) {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {

@@ -6,7 +6,7 @@
 //! leaks --atExit -- target/release/examples/resize 30
 //! ```
 
-use metalfx_wgpu::{DenoiserDescriptor, DenoiserParams, DenoiserTextures, MetalFxDenoiser};
+use metalfx_denoiser::{DenoiserDescriptor, DenoiserParams, DenoiserTextures, MetalFxDenoiser};
 
 fn main() {
     let cycles: u32 = std::env::args().nth(1).map_or(10, |s| s.parse().unwrap());

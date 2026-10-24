@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use metalfx_wgpu::{DenoiserDescriptor, DenoiserParams, DenoiserTextures, MetalFxDenoiser};
+use metalfx_denoiser::{DenoiserDescriptor, DenoiserParams, DenoiserTextures, MetalFxDenoiser};
 
 // ---------------------------------------------------------------------------------------------
 // Options
